@@ -4,7 +4,7 @@ name: notify-telegram
 # diff against the last-seen state object in GCS, and post deltas to Telegram.
 #
 # Skips silently when TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID are absent —
-# this lets the workflow live in master before you wire up the bot.
+# this lets the workflow live in main before you wire up the bot.
 
 on:
   schedule:
