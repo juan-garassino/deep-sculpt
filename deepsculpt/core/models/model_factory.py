@@ -20,7 +20,7 @@ from .gan.generator import (
 from .gan.discriminator import (
     SimpleDiscriminator, ComplexDiscriminator, ProgressiveDiscriminator,
     ConditionalDiscriminator, SpectralNormDiscriminator, MultiScaleDiscriminator,
-    PatchDiscriminator, LightDiscriminator
+    PatchDiscriminator, LightDiscriminator, SliceDiscriminator2D
 )
 from .diffusion.unet import UNet3D, ConditionalUNet3D
 from .diffusion.noise_scheduler import NoiseScheduler, DDIMScheduler, DPMSolverScheduler, AdaptiveScheduler
@@ -55,6 +55,7 @@ class PyTorchModelFactory:
         "multi_scale": MultiScaleDiscriminator,
         "patch": PatchDiscriminator,
         "light": LightDiscriminator,
+        "slice": SliceDiscriminator2D,  # SliceGAN 2D->3D slicing critic (from-2D-imagery)
     }
     
     DIFFUSION_REGISTRY = {
@@ -188,6 +189,9 @@ class PyTorchModelFactory:
             model_kwargs["num_scales"] = kwargs.get("num_scales", 3)
         elif model_type == "patch":
             model_kwargs["patch_size"] = kwargs.get("patch_size", 16)
+        elif model_type == "slice":
+            model_kwargs["axis"] = kwargs.get("axis", 0)
+            model_kwargs["spectral"] = kwargs.get("spectral", True)
         
         # Add any additional kwargs
         model_kwargs.update(kwargs)

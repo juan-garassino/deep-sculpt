@@ -30,6 +30,37 @@ from .base_trainer import BaseTrainer, TrainingConfig
 from .training_metrics import TrainingMetrics
 
 
+def r1_gradient_penalty(
+    discriminator: nn.Module,
+    real_samples: torch.Tensor,
+    gamma: float = 10.0,
+) -> torch.Tensor:
+    """StyleGAN2 R1 gradient penalty (3D), a stable WGAN-GP alternative.
+
+    Port of ``D_logistic_r1`` from sh4174/3DStyleGAN (``training/loss.py:52``).
+    Penalizes the squared gradient norm of the *real* logits w.r.t. the real
+    inputs only — no interpolation pass, so it is cheaper and more stable than
+    WGAN-GP at growing 3D resolutions. Returns ``0.5 * gamma * E[||∇D(x)||²]``.
+
+    Standalone (module-level) twin of ``GANTrainer._compute_r1_penalty`` so it
+    can be unit-tested and reused outside the trainer. Config-toggled in the
+    trainer via ``TrainingConfig.gan_loss_type`` ("softplus" uses R1,
+    "wgan-gp" uses the interpolated gradient penalty) and ``r1_gamma``.
+
+    NEEDS-GPU-VALIDATION: mode-collapse suppression vs WGAN-GP is unverified
+    on real training runs; shape/gradient behaviour is unit-tested.
+    """
+    real = real_samples.detach().requires_grad_(True)
+    logits = discriminator(real)
+    (grads,) = torch.autograd.grad(
+        outputs=logits.sum(),
+        inputs=real,
+        create_graph=True,
+    )
+    r1 = grads.square().reshape(grads.shape[0], -1).sum(dim=1).mean()
+    return 0.5 * gamma * r1
+
+
 class GANTrainer(BaseTrainer):
     """
     Specialized trainer for GAN models with advanced training techniques.
