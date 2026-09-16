@@ -480,3 +480,152 @@ class LightDiscriminator(BaseDiscriminator):
         if return_features:
             return logit, [f1, f2, f3]
         return logit
+
+
+# ---------------------------------------------------------------------------
+# Ported building blocks (sh4174/3DStyleGAN + stke9/SliceGAN)
+# ---------------------------------------------------------------------------
+#
+# NEEDS-GPU-VALIDATION: the two classes below are shape-verified only. Their
+# training dynamics (mode-collapse suppression for the stddev layer, 2D->3D
+# convergence for the slicing critic) have NOT been validated on a real GPU
+# training run. See the RunPod validation checklist in the PR.
+
+
+class MinibatchStdDev3D(nn.Module):
+    """3D minibatch standard-deviation layer (StyleGAN2, lifted to 3D).
+
+    Port of ``minibatch_stddev_layer`` from sh4174/3DStyleGAN
+    (``training/networks3d_stylegan2.py:139``). Computes the per-feature
+    stddev across a group of samples, averages it to a single scalar, and
+    appends it as one extra constant channel to every voxel of every sample.
+
+    This gives the discriminator a cheap statistic of batch diversity: when
+    the generator mode-collapses the batch stddev drops, the appended channel
+    goes flat, and D can trivially call the batch fake. Classic anti-mode-
+    collapse trick — a drop-in for the final block of any 3D critic.
+
+    Args:
+        group_size: samples per stddev group (clamped to the batch size).
+        num_new_features: number of stddev channels to append (default 1).
+    """
+
+    def __init__(self, group_size: int = 4, num_new_features: int = 1):
+        super().__init__()
+        self.group_size = group_size
+        self.num_new_features = num_new_features
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (N, C, D, H, W)
+        n, c, d, h, w = x.shape
+        # Group size divides the batch; fall back to the whole batch otherwise.
+        g = min(self.group_size, n)
+        while n % g != 0:
+            g -= 1
+        f = self.num_new_features
+        # (G, n//G, F, C//F, D, H, W)
+        y = x.reshape(g, -1, f, c // f, d, h, w)
+        y = y - y.mean(dim=0, keepdim=True)          # subtract group mean
+        y = y.square().mean(dim=0)                    # variance over group
+        y = (y + 1e-8).sqrt()                         # stddev
+        y = y.mean(dim=[2, 3, 4, 5], keepdim=True)    # average over C//F,D,H,W
+        y = y.squeeze(2)                              # (n//G, F, 1, 1, 1)
+        y = y.repeat(g, 1, d, h, w)                   # broadcast back to (N, F, D, H, W)
+        return torch.cat([x, y], dim=1)               # append as new channels
+
+
+class SliceDiscriminator2D(BaseDiscriminator):
+    """SliceGAN 2D critic that judges axial slices of a 3D volume.
+
+    Port of the 2D->3D slicing trick from stke9/SliceGAN
+    (``slicegan/model.py:96-135``, ``networks.py``). Instead of a 3D critic,
+    a purely 2D WGAN critic scores every slice taken along each of the three
+    principal axes; the 3D volume is turned into a batch of 2D images via the
+    permute/reshape trick
+
+        vol.permute(0, d1, 1, d2, d3).reshape(l * B, C, l, l)
+
+    with ``(d1,d2,d3)`` cycling ``[2,3,4], [3,2,2], [4,4,3]`` for the x/y/z
+    axes. This lets deep-sculpt train a **3D generator from 2D reference
+    imagery** (drawings, photos, textures) for which no 3D ground truth
+    exists — the single most novel capability in the ported cluster.
+
+    Registry-selectable as ``"slice"``. ``forward`` accepts either a 3D volume
+    ``(B, C, D, H, W)`` — sliced internally along ``axis`` — or a pre-sliced
+    batch of 2D images ``(B, C, H, W)``.
+
+    The 2D critic's input width is taken from ``BaseDiscriminator.input_channels``
+    (6 for ``color_mode=1``, 1 for mono) so a sliced ``(l*B, C, l, l)`` batch
+    carries the same channel count as the volume it came from.
+
+    Args:
+        void_dim: side length of the (cubic) 3D volume.
+        color_mode: 0 mono (1ch), 1 color (6ch) — same convention as the 3D critics.
+        axis: which axis to slice when a 3D volume is passed (0=x,1=y,2=z).
+        spectral: wrap convs in spectral_norm (WGAN critic stability).
+    """
+
+    def __init__(
+        self,
+        void_dim: int = 64,
+        color_mode: int = 1,
+        sparse: bool = False,
+        axis: int = 0,
+        spectral: bool = True,
+    ):
+        super().__init__(void_dim, color_mode, sparse)
+        # self.input_channels is set by BaseDiscriminator (6 color / 1 mono).
+
+        if axis not in (0, 1, 2):
+            raise ValueError(f"axis must be 0, 1 or 2 (got {axis})")
+        self.axis = axis
+        self.spectral = spectral
+
+        def maybe_sn(module: nn.Module) -> nn.Module:
+            return nn.utils.spectral_norm(module) if spectral else module
+
+        # 2D critic: 4 strided convs, no batchnorm (WGAN-GP friendly).
+        self.conv1 = maybe_sn(nn.Conv2d(self.input_channels, 64, 4, 2, 1))
+        self.conv2 = maybe_sn(nn.Conv2d(64, 128, 4, 2, 1))
+        self.conv3 = maybe_sn(nn.Conv2d(128, 256, 4, 2, 1))
+        self.conv4 = maybe_sn(nn.Conv2d(256, 512, 4, 2, 1))
+        final_size = void_dim // 16  # after 4 stride-2 convs
+        self.fc = maybe_sn(nn.Linear(512 * final_size * final_size, 1))
+        self.leaky_relu = nn.LeakyReLU(0.2)
+
+    def slice_volume(self, volume: torch.Tensor, axis: Optional[int] = None) -> torch.Tensor:
+        """Turn a (B, C, D, H, W) volume into a (l*B, C, l, l) batch of slices.
+
+        Implements SliceGAN's 2D->3D trick (``slicegan/model.py:96-135``): the
+        volume is sliced along the chosen spatial ``axis`` and every slice
+        becomes an independent 2D image in the batch. Equivalent to SliceGAN's
+        ``permute(0, d1, 1, d2, d3).reshape(l*B, C, l, l)`` but expressed with
+        ``movedim`` so it is axis-correct for all three axes (the literal
+        SliceGAN permute table only round-trips for the isotropic-cube case).
+        """
+        axis = self.axis if axis is None else axis
+        b, c = volume.shape[0], volume.shape[1]
+        spatial_dim = 2 + axis           # tensor dim of the sliced spatial axis
+        length = volume.shape[spatial_dim]
+        # Move the sliced axis next to the batch dim, then fold it into batch.
+        # (B, C, D, H, W) -> (B, L, C, l, l) -> (L*B, C, l, l)
+        moved = volume.movedim(spatial_dim, 1)          # (B, L, C, r1, r2)
+        return moved.reshape(b * length, c, moved.shape[3], moved.shape[4])
+
+    def _score_2d(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.leaky_relu(self.conv1(x))
+        x = self.leaky_relu(self.conv2(x))
+        x = self.leaky_relu(self.conv3(x))
+        x = self.leaky_relu(self.conv4(x))
+        x = x.reshape(x.size(0), -1)
+        return self.fc(x)  # logits; WGAN loss handled by the trainer
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # 5D input -> slice the volume; 4D input -> already-sliced 2D batch.
+        if x.dim() == 5:
+            x = self.slice_volume(x)
+        elif x.dim() != 4:
+            raise ValueError(
+                f"SliceDiscriminator2D expects a 5D volume or 4D slice batch, got {x.dim()}D"
+            )
+        return self._score_2d(x)
