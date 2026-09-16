@@ -130,7 +130,7 @@ deepsculpt/
 │   ├── data/{generation,loaders,sparse,transforms}/   # shape gen, dataloaders, encoding
 │   ├── latent/{ops,loader,directions}.py              # latent navigation: walks, traversal, PCA directions
 │   ├── models/
-│   │   ├── gan/{generator,discriminator}.py           # 5 gens, 8 discs incl. SelfAttention3D, LightDiscriminator
+│   │   ├── gan/{generator,discriminator}.py           # 5 gens, 9 discs incl. SelfAttention3D, LightDiscriminator, SliceDiscriminator2D (+ MinibatchStdDev3D)
 │   │   ├── diffusion/{unet,noise_scheduler,pipeline,pytorch_diffusion}.py  # pytorch_diffusion is unused reference code
 │   │   ├── base_models.py, model_factory.py
 │   ├── training/{gan_trainer,diffusion_trainer,base_trainer,optimizers,schedulers}.py
@@ -148,3 +148,14 @@ docs/                             # architecture, training, operations, inferenc
 boilerplate/                      # archived TF/Keras v1 code (do not propagate)
 checkpoints/                      # local checkpoint dir; legacy samples committed under data/11/
 ```
+
+## Ported upstream techniques (SliceGAN + 3DStyleGAN)
+
+Ported from `003-knowledge-playgrounds/references/analysis/deep-sculpt-3d.md`. **All shape/import-verified only — NEEDS-GPU-VALIDATION** (see the RunPod checklist in PR `feat/port-slicegan-stability`). Do not treat as convergence-tested.
+
+- **`SliceDiscriminator2D`** (`core/models/gan/discriminator.py`, registry key `"slice"`) — SliceGAN's 2D→3D slicing critic (stke9/SliceGAN `model.py:96-135`). A purely 2D WGAN critic scores axial slices of the 3D volume: `slice_volume()` turns `(B,C,D,H,W)` → `(l·B,C,l,l)` (via `movedim`, axis-correct for all 3 axes — the literal SliceGAN permute table only round-trips for isotropic cubes). `forward()` accepts a 5D volume (sliced internally along `axis`) or a pre-sliced 4D batch. Purpose: **train 3D generators from 2D reference imagery** with no 3D ground truth. Uses `BaseDiscriminator.input_channels` (6 color / 1 mono) — does NOT depend on the `feat/shodhan-dataset` `SEMANTIC_CLASSES` scheme.
+- **`MinibatchStdDev3D`** (`core/models/gan/discriminator.py`) — 3D minibatch-stddev layer (sh4174/3DStyleGAN `networks3d_stylegan2.py:139`). Appends a batch-diversity channel to a critic's final block; anti-mode-collapse. Drop-in `nn.Module`, group-size clamps to divide the batch.
+- **`r1_gradient_penalty(disc, real, gamma)`** (`core/training/gan_trainer.py`, module-level) — StyleGAN2 R1 penalty (3DStyleGAN `loss.py:52`), a cheaper/more-stable WGAN-GP alternative. Standalone testable twin of the existing `GANTrainer._compute_r1_penalty`. Config-toggled in the trainer via `TrainingConfig.gan_loss_type` (`"softplus"`→R1, `"wgan-gp"`→interpolated GP) + `r1_gamma`.
+- **Volumetric eval bundle** (`core/training/training_metrics.py`, module-level fns): `msssim_3d` (3D MS-SSIM, volumetric-FID stand-in), `soft_dice` + `occupancy_class_weight` (vnet.pytorch imbalance-aware recon signal), `max_connected_component` (3dgan-release debris cleanup, rewritten on `scipy.ndimage.label`; accepts numpy or torch). Feeds the `ds-improve` eval loop.
+
+Shape/import tests: `tests/unit/test_slicegan_stability_port.py` (21 tests). No local torch env — verified in an isolated CPU-torch venv; `tests/test_trainer.py` and 7 `test_pytorch_models.py` cases fail pre-existing on `main` (unrelated).

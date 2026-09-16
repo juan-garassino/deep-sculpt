@@ -22,7 +22,9 @@ from .discriminator import (
     ConditionalDiscriminator,
     SpectralNormDiscriminator,
     MultiScaleDiscriminator,
-    PatchDiscriminator
+    PatchDiscriminator,
+    SliceDiscriminator2D,
+    MinibatchStdDev3D,
 )
 
 __all__ = [
@@ -43,4 +45,6 @@ __all__ = [
     "SpectralNormDiscriminator",
     "MultiScaleDiscriminator",
     "PatchDiscriminator",
+    "SliceDiscriminator2D",
+    "MinibatchStdDev3D",
 ]

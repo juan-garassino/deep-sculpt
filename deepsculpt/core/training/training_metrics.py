@@ -6,6 +6,7 @@ tools for monitoring training progress and model performance.
 """
 
 import torch
+import torch.nn.functional as F
 import numpy as np
 import matplotlib.pyplot as plt
 from typing import Dict, Any, Optional, List, Union, Tuple
@@ -566,3 +567,149 @@ class TrainingMetrics:
             report.append(f"ANOMALIES: {len(recent_anomalies)} in last 1000 steps")
         
         return "\n".join(report)
+
+
+# ---------------------------------------------------------------------------
+# Volumetric eval bundle (ported: 3DStyleGAN + vnet.pytorch + 3dgan-release)
+# ---------------------------------------------------------------------------
+#
+# NEEDS-GPU-VALIDATION: these are shape/numerics-verified helpers only; their
+# usefulness as a volumetric-FID stand-in / reconstruction signal on the real
+# ds-improve eval loop has not been validated against a trained model.
+
+
+def msssim_3d(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    levels: int = 3,
+    window: int = 7,
+    sigma: float = 1.5,
+) -> torch.Tensor:
+    """3D multi-scale SSIM between two occupancy/feature volumes.
+
+    Port of ``msssim_3d`` from sh4174/3DStyleGAN (``metrics/ms_ssim.py:46``):
+    a Gaussian-windowed SSIM computed at ``levels`` scales via an
+    ``avg_pool3d`` pyramid, geometric-mean combined. Serves as a
+    volumetric-FID stand-in / sample-similarity metric for the ds-improve loop.
+
+    Inputs are ``(B, C, D, H, W)`` (any C); returns a scalar mean SSIM in
+    roughly [0, 1] (1 == identical).
+    """
+    if x.shape != y.shape:
+        raise ValueError(f"msssim_3d: shape mismatch {tuple(x.shape)} vs {tuple(y.shape)}")
+    x = x.float()
+    y = y.float()
+    channels = x.shape[1]
+
+    # Separable 3D Gaussian kernel.
+    coords = torch.arange(window, dtype=torch.float32, device=x.device) - (window - 1) / 2.0
+    g1 = torch.exp(-(coords ** 2) / (2 * sigma ** 2))
+    g1 = g1 / g1.sum()
+    kernel = g1[:, None, None] * g1[None, :, None] * g1[None, None, :]
+    kernel = kernel.expand(channels, 1, window, window, window).contiguous()
+    pad = window // 2
+    c1, c2 = 0.01 ** 2, 0.03 ** 2
+
+    def _ssim(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        mu_a = F.conv3d(a, kernel, padding=pad, groups=channels)
+        mu_b = F.conv3d(b, kernel, padding=pad, groups=channels)
+        mu_a2, mu_b2, mu_ab = mu_a * mu_a, mu_b * mu_b, mu_a * mu_b
+        var_a = F.conv3d(a * a, kernel, padding=pad, groups=channels) - mu_a2
+        var_b = F.conv3d(b * b, kernel, padding=pad, groups=channels) - mu_b2
+        cov = F.conv3d(a * b, kernel, padding=pad, groups=channels) - mu_ab
+        ssim_map = ((2 * mu_ab + c1) * (2 * cov + c2)) / (
+            (mu_a2 + mu_b2 + c1) * (var_a + var_b + c2)
+        )
+        return ssim_map.mean()
+
+    scores = []
+    a, b = x, y
+    for level in range(levels):
+        scores.append(_ssim(a, b).clamp_min(1e-8))
+        if level < levels - 1:
+            # Downsample the pyramid; guard against volumes too small to pool.
+            if min(a.shape[2:]) < 2:
+                break
+            a = F.avg_pool3d(a, 2)
+            b = F.avg_pool3d(b, 2)
+    stacked = torch.stack(scores)
+    return stacked.log().mean().exp()  # geometric mean of per-scale SSIM
+
+
+def soft_dice(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Soft Dice coefficient for sparse voxel occupancy.
+
+    Port of the Dice objective from mattmacy/vnet.pytorch
+    (``train.py:320`` / ``bioloss.dice_loss``). Sparse sculptures have extreme
+    foreground/background imbalance (occupancy a few %), where Dice is a far
+    better reconstruction/eval signal than raw BCE. Returns Dice in [0, 1]
+    (1 == perfect overlap); ``1 - soft_dice`` is the loss form.
+
+    Both tensors are occupancy fields (any matching shape); values are treated
+    as soft probabilities so this is differentiable.
+    """
+    if pred.shape != target.shape:
+        raise ValueError(f"soft_dice: shape mismatch {tuple(pred.shape)} vs {tuple(target.shape)}")
+    p = pred.float().reshape(pred.shape[0], -1)
+    t = target.float().reshape(target.shape[0], -1)
+    intersection = (p * t).sum(dim=1)
+    denom = p.sum(dim=1) + t.sum(dim=1)
+    dice = (2 * intersection + eps) / (denom + eps)
+    return dice.mean()
+
+
+def occupancy_class_weight(target_mean: float) -> float:
+    """Occupancy-derived background weight for imbalanced voxel CE/BCE.
+
+    One-liner recipe from vnet.pytorch (``train.py:225``):
+    ``bg_weight = target_mean / (1 + target_mean)``. Weights the abundant
+    background class down in proportion to dataset occupancy.
+    """
+    return target_mean / (1.0 + target_mean)
+
+
+def max_connected_component(
+    volume,
+    threshold: float = 0.5,
+    connectivity: int = 1,
+):
+    """Keep only the largest connected occupied component (debris cleanup).
+
+    Port of ``max_connected`` from zck119/3dgan-release
+    (``visualization/python/util.py:110``), rewritten with
+    ``scipy.ndimage.label`` instead of the original O(n³) Python flood fill.
+    GAN outputs frequently contain floating single-voxel debris; this keeps the
+    largest 6/18/26-connected blob and zeros the rest — an artifact-free export
+    post-process for ``volume_export``.
+
+    Accepts a numpy array or a torch tensor ``(D, H, W)`` (or ``(1, D, H, W)``);
+    returns the same type/shape, binarized to {0, 1}.
+    """
+    from scipy import ndimage
+
+    is_torch = isinstance(volume, torch.Tensor)
+    arr = volume.detach().cpu().numpy() if is_torch else np.asarray(volume)
+    squeezed = arr.ndim == 4 and arr.shape[0] == 1
+    work = arr[0] if squeezed else arr
+
+    occupied = work > threshold
+    structure = ndimage.generate_binary_structure(3, connectivity)
+    labels, n = ndimage.label(occupied, structure=structure)
+    if n > 0:
+        # Component sizes (index 0 is background — ignore it).
+        sizes = np.bincount(labels.ravel())
+        sizes[0] = 0
+        keep = int(sizes.argmax())
+        cleaned = (labels == keep).astype(arr.dtype)
+    else:
+        cleaned = np.zeros_like(work, dtype=arr.dtype)
+
+    if squeezed:
+        cleaned = cleaned[None, ...]
+    if is_torch:
+        return torch.from_numpy(cleaned).to(volume.device)
+    return cleaned
