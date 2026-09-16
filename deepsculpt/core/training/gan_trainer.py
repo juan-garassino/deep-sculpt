@@ -134,7 +134,8 @@ class GANTrainer(BaseTrainer):
         try:
             # New PyTorch 2.9+ API
             from torch.amp import GradScaler
-            self.disc_scaler = GradScaler('cuda') if config.mixed_precision and device != 'cpu' else None
+            # AMP GradScaler is CUDA-only — guard so MPS/CPU (e.g. M5 Max) don't crash here
+            self.disc_scaler = GradScaler('cuda') if config.mixed_precision and str(device).startswith('cuda') else None
         except ImportError:
             # Fallback for older PyTorch versions
             from torch.cuda.amp import GradScaler
