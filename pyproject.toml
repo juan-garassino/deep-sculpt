@@ -186,12 +186,12 @@ api = [
 
 # All optional dependencies
 all = [
-    "deepsculpt-v2[dev,tracking,pytorch-extras,sparse,viz3d,viz,performance,distributed,deployment,colab,cloud,api]"
+    "deepsculpt[dev,tracking,pytorch-extras,sparse,viz3d,viz,performance,distributed,deployment,colab,cloud,api]"
 ]
 
 # Minimal installation for CI/testing
 minimal = [
-    "deepsculpt-v2[dev]"
+    "deepsculpt[dev]"
 ]
 
 [project.urls]
