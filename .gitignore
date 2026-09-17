@@ -39,3 +39,6 @@ infra/**/.terraform/
 *.tfvars
 !*.tfvars.example
 .superpowers/
+
+# real env files stay local; commit only *.sample / *.example
+.env.docker
