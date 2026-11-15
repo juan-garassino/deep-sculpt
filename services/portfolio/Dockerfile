@@ -7,8 +7,8 @@ RUN pip install --no-cache-dir uv==0.13.5 \
  && uv pip install --system --no-cache numpy==1.26.4 fastapi==0.116.1 "uvicorn[standard]==0.53.0" pydantic==2.13.5
 WORKDIR /app
 COPY app.py /app/app.py
-COPY weights/ /app/weights/
-ENV DEEPSCULPT_WEIGHTS=/app/weights PORT=8080
+# No weights in the image: app.py pulls deepsculpt-gan@champion/@challenger from MLflow at boot.
+ENV DEEPSCULPT_WEIGHTS=/tmp/weights PORT=8080
 RUN useradd -m -u 10001 sculpt
 USER sculpt
 HEALTHCHECK CMD python -c "import urllib.request,os;urllib.request.urlopen(f'http://127.0.0.1:{os.environ[\"PORT\"]}/health',timeout=3)"
