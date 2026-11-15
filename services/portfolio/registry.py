@@ -8,8 +8,8 @@ right away, then a background thread runs `materialize`:
   3. downloads the `serve/` subtree of each champion's RUN (metadata such as meta.json, the
      eval metrics, held-out sample inputs/evidence) into the same local root — first model
      listed wins on a name clash,
-  4. runs the `on_ready(fn)` hooks (apps that build state from those files), then flips
-     `ready()`.
+  4. runs the `on_ready(fn)` / `warm(fn)` hooks (app state built from those files, and the
+     model load itself), then flips `ready()` — so no request reaches a half-loaded model.
 (`run_in_background(load)` is the same loop around any loader, for serves whose artifacts are
 not one .keras per model — deep-sculpt's TorchScript files reuse this module that way.)
 The HTTP server is up the whole time: `install(app)` adds a gate in front of the app. Until
@@ -71,6 +71,7 @@ STATE: dict = {"status": "idle", "error": None, "attempts": 0}   # what /health 
 _READY = threading.Event()
 _HOOKS: list[Callable[[], None]] = []    # on_ready functions, run by the loader before _READY
 _HOOK_LOCK = threading.Lock()
+_READY_AT: dict = {"t": None}   # monotonic time the background load finished (tracker mode only)
 _TOKEN: dict = {"value": "", "expires": 0.0}
 _sleep = time.sleep          # tests swap these two for a fake clock
 _clock = time.monotonic
@@ -111,6 +112,10 @@ def _gate_wait() -> float:
 
 def _health_wait() -> float:
     return float(os.environ.get("REGISTRY_HEALTH_WAIT_S", "25"))  # e.g. 25 (then 503 "loading")
+
+
+def _warm_grace() -> float:
+    return float(os.environ.get("REGISTRY_WARM_GRACE_S", "120"))  # e.g. 120 (s after ready)
 
 
 # ------------------------------------------------------------------------------ retries
@@ -379,6 +384,15 @@ def on_ready(fn: Callable[[], None]) -> Callable[[], None]:
     return fn
 
 
+def warm(fn: Callable[[], None]) -> Callable[[], None]:
+    """Load the model (or anything a route needs in memory) before ready() flips: the gate then
+    holds or 503s every request until it is in, so none can race a half-loaded model. Only with
+    a tracker: without one (tests, local runs) loads stay lazy. Usable as a decorator."""
+    if _tracker():
+        on_ready(fn)
+    return fn
+
+
 def _load_until_ready(load: Callable[[], None]) -> None:
     while True:
         STATE.update(status="loading", attempts=STATE["attempts"] + 1)
@@ -388,6 +402,7 @@ def _load_until_ready(load: Callable[[], None]) -> None:
                 for fn in _HOOKS:
                     fn()
                 STATE.update(status="ready", error=None)
+                _READY_AT["t"] = time.monotonic()
                 _READY.set()
             return
         except Exception as e:  # stay up, report it on /health, try again
@@ -421,9 +436,24 @@ def start(models: dict[str, str], env: dict[str, str], background: bool = True) 
     run_in_background(lambda: materialize(models, env), background)
 
 
+async def _send_503(send, status: str, detail: str) -> None:
+    body = json.dumps({"status": status, "model_loaded": False, "error": STATE["error"],
+                       "attempts": STATE["attempts"], "detail": detail}).encode()
+    await send({"type": "http.response.start", "status": 503, "headers": [
+        (b"content-type", b"application/json"), (b"content-length", str(len(body)).encode()),
+        (b"retry-after", b"5"), (b"access-control-allow-origin", b"*"),
+        (b"cache-control", b"no-store")]})
+    await send({"type": "http.response.body", "body": body})
+
+
 class ReadinessGate:
     """ASGI gate: until ready, requests wait for readiness (health REGISTRY_HEALTH_WAIT_S, the
     rest REGISTRY_GATE_WAIT_S), then get 503 {"status": "loading"|"failed"} + Retry-After.
+
+    Safety net for the first REGISTRY_WARM_GRACE_S after a background load finishes: a request
+    that dies with an unhandled exception before its response started gets 503 {"status":
+    "warming"} + Retry-After instead of a 500 (logged with its traceback) — a visitor racing the
+    warm-up retries instead of seeing an error. After the grace window errors are errors again.
 
     CORS preflights pass straight through, and the 503 carries `access-control-allow-origin: *`
     itself, so it works whatever the middleware order.
@@ -433,22 +463,32 @@ class ReadinessGate:
         self.app = app
 
     async def __call__(self, scope, receive, send):
-        if scope["type"] != "http" or _READY.is_set() or scope.get("method") == "OPTIONS":
+        if scope["type"] != "http" or scope.get("method") == "OPTIONS":
             return await self.app(scope, receive, send)
-        wait = _health_wait() if scope.get("path") in HEALTH_PATHS else _gate_wait()
-        deadline = time.monotonic() + wait
-        while not _READY.is_set() and time.monotonic() < deadline:
-            await asyncio.sleep(0.25)
-        if _READY.is_set():
+        if not _READY.is_set():
+            wait = _health_wait() if scope.get("path") in HEALTH_PATHS else _gate_wait()
+            deadline = time.monotonic() + wait
+            while not _READY.is_set() and time.monotonic() < deadline:
+                await asyncio.sleep(0.25)
+            if not _READY.is_set():
+                return await _send_503(send, STATE["status"], "loading the model from the MLflow registry")
+        ready_at = _READY_AT["t"]
+        if ready_at is None or time.monotonic() - ready_at > _warm_grace():
             return await self.app(scope, receive, send)
-        body = json.dumps({"status": STATE["status"], "model_loaded": False,
-                           "error": STATE["error"], "attempts": STATE["attempts"],
-                           "detail": "loading the model from the MLflow registry"}).encode()
-        await send({"type": "http.response.start", "status": 503, "headers": [
-            (b"content-type", b"application/json"), (b"content-length", str(len(body)).encode()),
-            (b"retry-after", b"5"), (b"access-control-allow-origin", b"*"),
-            (b"cache-control", b"no-store")]})
-        await send({"type": "http.response.body", "body": body})
+        started = False
+
+        async def tracking_send(msg):
+            nonlocal started
+            if msg["type"] == "http.response.start":
+                started = True
+            await send(msg)
+        try:
+            await self.app(scope, receive, tracking_send)
+        except Exception:
+            if started:
+                raise
+            logger.exception("%s failed during warm-up; answering 503 + Retry-After", scope.get("path"))
+            await _send_503(send, "warming", "the model is still warming up, retry shortly")
 
 
 def install(app) -> None:
