@@ -6,7 +6,7 @@ RUN pip install --no-cache-dir uv==0.13.5 \
  && uv pip install --system --no-cache --index-url https://download.pytorch.org/whl/cpu torch==2.15.0 \
  && uv pip install --system --no-cache numpy==1.26.4 fastapi==0.116.1 "uvicorn[standard]==0.53.0" pydantic==2.13.5
 WORKDIR /app
-COPY app.py /app/app.py
+COPY app.py registry.py /app/
 # No weights in the image: app.py pulls deepsculpt-gan@champion/@challenger from MLflow at boot.
 ENV DEEPSCULPT_WEIGHTS=/tmp/weights PORT=8080
 RUN useradd -m -u 10001 sculpt
