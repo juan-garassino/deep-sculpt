@@ -138,6 +138,7 @@ deepsculpt/
 │   ├── visualization/{pytorch_visualization,volume_export}.py  # volume_export: pure GIF/PNG/mesh writers (no GCS)
 │   └── workflow/{pytorch_workflow,pytorch_mlflow_tracking}.py
 services/                         # Cloud Run trio: trainer job, inference FastAPI (has its own latent_walk endpoint), mlflow
+services/portfolio/               # CPU serve for the art² Work section + ML gateway (project `deepsculpt`): export.py (trainer checkpoint → TorchScript + meta.json; raw generator, not EMA), app.py (loads `deepsculpt-gan` @champion/@challenger from garassino-mlflow at boot — no weights in the image; /health, /api/metrics, /api/volume?seed=&epoch=, POST /predict), deploy.sh (Cloud Run `deepsculpt-serve`, min 0). MLflow: experiment `deepsculpt`, @champion = epoch 75 of gan-shodhan-color-001, @challenger = epoch 17
 notebooks/                        # 9 Jupyter notebooks (Colab + local)
 scripts/                          # render_walk.py, walk_viewer.py, shodhan_probe.py, render_run_snapshots.py, cloud_audit.sh, colab_train*.py, autoresearch_report.py, preview_sample.py
 tests/                            # root files green (34 tests); 11 legacy collection errors in unit/ + integration/ + test_trainer.py — see Current status
